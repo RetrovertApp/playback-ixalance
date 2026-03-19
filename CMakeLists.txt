@@ -30,7 +30,7 @@ add_library(ixalance_static STATIC
     src/WaveLibrary.c
 )
 target_include_directories(ixalance_static PUBLIC src)
-target_link_libraries(ixalance_static PUBLIC ZLIB::ZLIB)
+target_link_libraries(ixalance_static PUBLIC zlib_static)
 # The webixs codebase uses LINUX to mean "modern non-Emscripten build"
 target_compile_definitions(ixalance_static PUBLIC LINUX)
 suppress_external_warnings(ixalance_static)
@@ -40,7 +40,7 @@ target_compile_options(ixalance_static PRIVATE -fno-strict-aliasing)
 # Build plugin shared library
 add_library(ixalance_playback SHARED ixalance_plugin.cpp)
 target_include_directories(ixalance_playback PRIVATE src)
-target_link_libraries(ixalance_playback PRIVATE ixalance_static ZLIB::ZLIB)
+target_link_libraries(ixalance_playback PRIVATE ixalance_static zlib_static)
 if(NOT WIN32)
     target_link_libraries(ixalance_playback PRIVATE stdc++ m)
 endif()
