@@ -44,11 +44,11 @@ struct IxalanceData {
     IXS::PlayerIXS* player;
     uint8_t* file_data;
     bool playing;
-    // Tracker display: second decompression buffer for non-current patterns
+    // Fallback decompression buffer when the engine's live pattern buffer is absent
     uint8_t tracker_pattern_buf[64000];
-    int tracker_cached_pattern;
-    // Scope capture
+    // Scope capture (allocated/attached by set_scope_enabled)
     IxsScopeCapture* scope_capture;
+    bool scope_enabled;
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -177,10 +177,9 @@ static int ixalance_open(void* user_data, const char* url, uint32_t subsong, con
     // Initialize audio output
     (*data->player->vftable->initAudioOut)(data->player);
     data->playing = true;
-    data->tracker_cached_pattern = -1;
 
-    // Reattach scope capture if it was previously allocated
-    if (data->scope_capture) {
+    // Reattach scope capture only if it was enabled; keep capture-side gating in sync with the flag
+    if (data->scope_enabled && data->scope_capture) {
         data->player->ptrCore_0x4->scopeCapture = data->scope_capture;
     }
 
@@ -198,7 +197,6 @@ static void ixalance_close(void* user_data) {
     }
 
     data->playing = false;
-    data->tracker_cached_pattern = -1;
 
     if (data->file_data) {
         rv_io_free_url_to_memory(data->file_data);
@@ -407,178 +405,233 @@ static int ixs_get_num_channels(IXS::Module* module) {
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static int ixalance_get_tracker_info(void* user_data, RVTrackerInfo* info) {
-    IxalanceData* data = (IxalanceData*)user_data;
-    if (!data || !data->player || !info) {
-        return -1;
+// Column schema: note, instrument, volume, effect command, effect parameter.
+enum { IXS_COLUMN_COUNT = 5 };
+
+static IXS::Module* ixs_module(IxalanceData* data) {
+    if (!data || !data->player || !data->player->ptrCore_0x4) {
+        return nullptr;
     }
-
-    memset(info, 0, sizeof(*info));
-
-    IXS::PlayerCore* core = data->player->ptrCore_0x4;
-    IXS::Module* module = core->ptrModule_0x8;
-
-    info->num_patterns = module->impulseHeader_0x0.PatNum_0x26;
-    info->num_channels = (uint8_t)ixs_get_num_channels(module);
-    info->num_orders = module->impulseHeader_0x0.OrdNum_0x20;
-    info->num_samples = module->impulseHeader_0x0.SmpNum_0x24;
-    info->current_pattern = core->order_0x3214;
-    // currentRow_0x3216 is incremented after processing each row's data,
-    // so it represents the *next* row to process, not the one currently playing.
-    info->current_row = core->currentRow_0x3216 > 0 ? core->currentRow_0x3216 - 1 : 0;
-    info->current_order = core->ordIdx_0x3215;
-    info->channels_synchronized = 1;
-
-    if (core->patternHeadPtr_0x321c) {
-        info->rows_per_pattern = core->patternHeadPtr_0x321c->rows_0x2;
-    }
-
-    strncpy(info->module_type, "ixs", sizeof(info->module_type) - 1);
-
-    // Song name: 26 bytes starting at songName_0x4 (12 bytes) + unknown_0x10 (14 bytes)
-    memcpy(info->song_name, module->impulseHeader_0x0.songName_0x4, 26);
-    info->song_name[26] = '\0';
-    // Trim trailing spaces/nulls
-    for (int i = 25; i >= 0; i--) {
-        if (info->song_name[i] == ' ' || info->song_name[i] == '\0') {
-            info->song_name[i] = '\0';
-        } else {
-            break;
-        }
-    }
-
-    // Sample names
-    uint16_t num_samples = info->num_samples;
-    if (num_samples > 32) num_samples = 32;
-    for (uint16_t i = 0; i < num_samples; i++) {
-        if (module->smplHeadPtrArr0_0xd0[i]) {
-            strncpy(info->sample_names[i], module->smplHeadPtrArr0_0xd0[i]->name_0x14,
-                    sizeof(info->sample_names[i]) - 1);
-            info->sample_names[i][sizeof(info->sample_names[i]) - 1] = '\0';
-        }
-    }
-
-    return 0;
+    return data->player->ptrCore_0x4->ptrModule_0x8;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int ixalance_get_pattern_cell(void* user_data, int pattern, int row, int channel, RVPatternCell* cell) {
+static bool ixalance_get_structure(void* user_data, RVVizInfo* out) {
     IxalanceData* data = (IxalanceData*)user_data;
-    if (!data || !data->player || !cell) {
-        return -1;
+    IXS::Module* module = ixs_module(data);
+    if (!module || !out) {
+        return false;
     }
+    uint32_t ch = (uint32_t)ixs_get_num_channels(module);
+    out->caps = RVVizCaps_PatternCells | RVVizCaps_Scope | RVVizCaps_WholeSongKnown;
+    out->scroll_mode = RVScrollMode_Synchronized;
+    out->pattern_channel_count = ch;
+    out->scope_channel_count = ch;
+    out->column_count = IXS_COLUMN_COUNT;
+    return true;
+}
 
+static uint32_t ixalance_get_columns(void* user_data, RVColumnDesc* out, uint32_t cap) {
+    (void)user_data;
+    static const struct {
+        const char* label;
+        uint8_t width;
+        RVColumnKind kind;
+    } cols[IXS_COLUMN_COUNT] = {
+        {"Note", 3, RVColumnKind_Note}, {"Inst", 2, RVColumnKind_Instrument}, {"Vol", 3, RVColumnKind_Volume},
+        {"Eff", 1, RVColumnKind_Effect}, {"Prm", 2, RVColumnKind_Param},
+    };
+    uint32_t n = cap < IXS_COLUMN_COUNT ? cap : IXS_COLUMN_COUNT;
+    for (uint32_t i = 0; i < n; i++) {
+        memset(out[i].label, 0, sizeof(out[i].label));
+        strncpy((char*)out[i].label, cols[i].label, sizeof(out[i].label) - 1);
+        out[i].char_width = cols[i].width;
+        out[i].kind = cols[i].kind;
+    }
+    return n;
+}
+
+static uint32_t ixalance_fill_channels(IxalanceData* data, RVChannelDesc* out, uint32_t cap) {
+    IXS::Module* module = ixs_module(data);
+    if (!module || !out) {
+        return 0;
+    }
+    uint32_t count = (uint32_t)ixs_get_num_channels(module);
+    if (count > cap) {
+        count = cap;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        memset(out[i].name, 0, sizeof(out[i].name));
+        snprintf((char*)out[i].name, sizeof(out[i].name), "Ch %u", i + 1);
+        out[i].scope_width = 0; // mono
+    }
+    return count;
+}
+
+static uint32_t ixalance_get_pattern_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    return ixalance_fill_channels((IxalanceData*)user_data, out, cap);
+}
+
+static uint32_t ixalance_get_scope_channels(void* user_data, RVChannelDesc* out, uint32_t cap) {
+    return ixalance_fill_channels((IxalanceData*)user_data, out, cap);
+}
+
+static bool ixalance_get_position(void* user_data, RVTrackerPosition* out) {
+    IxalanceData* data = (IxalanceData*)user_data;
+    if (!ixs_module(data) || !out) {
+        return false;
+    }
     IXS::PlayerCore* core = data->player->ptrCore_0x4;
-    IXS::Module* module = core->ptrModule_0x8;
+    out->order = core->ordIdx_0x3215;
+    out->pattern = core->order_0x3214;
+    // currentRow_0x3216 is incremented after processing each row's data,
+    // so it represents the *next* row to process, not the one currently playing.
+    out->row = core->currentRow_0x3216 > 0 ? core->currentRow_0x3216 - 1 : 0;
+    out->window_lo = 0;
+    out->window_hi = core->patternHeadPtr_0x321c ? core->patternHeadPtr_0x321c->rows_0x2 : 0;
+    return true;
+}
 
+static uint32_t ixalance_get_channel_rows(void* user_data, uint32_t* out, uint32_t cap) {
+    (void)user_data;
+    (void)out;
+    (void)cap;
+    return 0; // Synchronized: window comes from get_position
+}
+
+static const char s_note_names[12][3] = {"C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"};
+
+// Render one 5-byte IXS cell (note, instrument, vol/pan, command, command arg) into the column's
+// raw value + fixed-width text. `col` is the column index in the schema declared by get_columns.
+static void ixs_render_cell(RVPatternCell* out, int col, const uint8_t* src) {
+    uint8_t note = src[0], ins = src[1], vol = src[2], cmd = src[3], arg = src[4];
+    memset(out->text, 0, sizeof(out->text));
+    switch (col) {
+        case 0: // Note — engine stores IT note (0..119 = C-0..B-9), 254 cut, 255 off, 0 empty
+            out->raw = note;
+            if (note >= 1 && note <= 119)
+                snprintf((char*)out->text, sizeof(out->text), "%s%u", s_note_names[note % 12], note / 12);
+            else if (note == 255)
+                strncpy((char*)out->text, "===", sizeof(out->text) - 1); // note off
+            else if (note == 254)
+                strncpy((char*)out->text, "^^^", sizeof(out->text) - 1); // note cut
+            else
+                strncpy((char*)out->text, "...", sizeof(out->text) - 1); // empty
+            break;
+        case 1: // Instrument
+            out->raw = ins;
+            if (ins == 0)
+                strncpy((char*)out->text, "..", sizeof(out->text) - 1);
+            else
+                snprintf((char*)out->text, sizeof(out->text), "%02u", ins);
+            break;
+        case 2: // Volume/pan — 0xFF = empty
+            out->raw = vol;
+            if (vol == 0xFF)
+                strncpy((char*)out->text, "...", sizeof(out->text) - 1);
+            else
+                snprintf((char*)out->text, sizeof(out->text), "%3u", vol);
+            break;
+        case 3: // Effect command — raw = command byte, text = IT letter (1='A')
+            out->raw = cmd;
+            out->text[0] = (cmd >= 1 && cmd <= 26) ? (uint8_t)('A' + (cmd - 1)) : (uint8_t)'.';
+            break;
+        default: // 4: Effect parameter
+            out->raw = arg;
+            if (cmd == 0)
+                strncpy((char*)out->text, "..", sizeof(out->text) - 1);
+            else
+                snprintf((char*)out->text, sizeof(out->text), "%02X", arg);
+            break;
+    }
+}
+
+static uint32_t ixalance_get_cells(void* user_data, int32_t channel, uint32_t row_lo, uint32_t row_hi, RVPatternCell* out,
+                                   uint32_t cap) {
+    IxalanceData* data = (IxalanceData*)user_data;
+    IXS::Module* module = ixs_module(data);
+    if (!module || !out) {
+        return 0;
+    }
+    IXS::PlayerCore* core = data->player->ptrCore_0x4;
+    int pattern = core->order_0x3214; // synchronized: cells come from the current pattern
     if (pattern < 0 || pattern >= module->impulseHeader_0x0.PatNum_0x26) {
-        return -1;
+        return 0;
     }
-
     IXS::ITPatternHead* pat_head = module->patHeadPtrArray_0xd8[pattern];
-    if (!pat_head || row < 0 || row >= pat_head->rows_0x2 || channel < 0 || channel >= 64) {
-        return -1;
+    if (!pat_head) {
+        return 0;
     }
 
-    // Get the 5-byte cell data from the appropriate buffer
+    // Prefer the engine's live decompressed buffer; fall back to decompressing on demand.
     const uint8_t* buf;
-    if (pattern == core->order_0x3214 && core->buf16kPtr_0x3220) {
-        // Current pattern: use the already-decompressed buffer
+    if (core->buf16kPtr_0x3220) {
         buf = (const uint8_t*)core->buf16kPtr_0x3220->buf_0x0;
     } else {
-        // Other pattern: decompress on demand with caching
-        if (data->tracker_cached_pattern != pattern) {
-            ixs_decompress_pattern(pat_head, module->patDataPtrArray_0xdc[pattern],
-                                   data->tracker_pattern_buf);
-            data->tracker_cached_pattern = pattern;
-        }
+        ixs_decompress_pattern(pat_head, module->patDataPtrArray_0xdc[pattern], data->tracker_pattern_buf);
         buf = data->tracker_pattern_buf;
     }
 
-    uint32_t offset = ((uint32_t)row * 64 + (uint32_t)channel) * 5;
-    uint8_t note = buf[offset + 0];
-    uint8_t ins = buf[offset + 1];
-    uint8_t vol_pan = buf[offset + 2];
-    uint8_t cmd = buf[offset + 3];
-    uint8_t cmd_arg = buf[offset + 4];
-
-    // Note mapping: IXS 1-119 -> RV 2-120, IXS 255 -> RV 255 (note off), IXS 254 -> RV 254 (note cut)
-    // Note 0 in the buffer is ambiguous (could be C-0 or empty cell from memset); treat as empty
-    // since C-0 is virtually never used in IXS files.
-    if (note >= 1 && note <= 119) {
-        cell->note = note + 1;
-    } else if (note == 255) {
-        cell->note = 255;
-    } else if (note == 254) {
-        cell->note = 254;
-    } else {
-        cell->note = 0;
+    uint32_t num_rows = pat_head->rows_0x2;
+    if (row_hi > num_rows) {
+        row_hi = num_rows;
+    }
+    int num_ch = ixs_get_num_channels(module);
+    int ch_start = channel < 0 ? 0 : channel;
+    int ch_end = channel < 0 ? num_ch : channel + 1;
+    if (ch_start >= num_ch) {
+        return 0;
     }
 
-    cell->instrument = ins;
-
-    // Volume: 0xFF means empty
-    cell->volume = (vol_pan == 0xFF) ? 0 : vol_pan;
-
-    // Effect: IT-style cmd 1='A', 2='B', etc. cmd 0 = no effect
-    if (cmd >= 1 && cmd <= 26) {
-        cell->effect = 'A' + (cmd - 1);
-    } else {
-        cell->effect = 0;
+    uint32_t written = 0;
+    for (uint32_t row = row_lo; row < row_hi; row++) {
+        for (int ch = ch_start; ch < ch_end; ch++) {
+            const uint8_t* src = &buf[((uint32_t)row * 64 + (uint32_t)ch) * 5];
+            for (int c = 0; c < IXS_COLUMN_COUNT; c++) {
+                if (written >= cap) {
+                    return written;
+                }
+                ixs_render_cell(&out[written++], c, src);
+            }
+        }
     }
-    cell->effect_param = cmd_arg;
-    cell->dest_channel = 0;
-
-    return 0;
+    return written;
 }
 
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static int ixalance_get_pattern_num_rows(void* user_data, int pattern) {
+static void ixalance_set_scope_enabled(void* user_data, bool on) {
     IxalanceData* data = (IxalanceData*)user_data;
-    if (!data || !data->player) {
-        return 0;
+    if (!data || !data->player || !data->player->ptrCore_0x4) {
+        return;
     }
-
-    IXS::Module* module = data->player->ptrCore_0x4->ptrModule_0x8;
-
-    if (pattern < 0 || pattern >= module->impulseHeader_0x0.PatNum_0x26) {
-        return 0;
-    }
-
-    IXS::ITPatternHead* pat_head = module->patHeadPtrArray_0xd8[pattern];
-    return pat_head ? pat_head->rows_0x2 : 0;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static uint32_t ixalance_get_scope_data(void* user_data, int channel, float* buffer, uint32_t num_samples) {
-    IxalanceData* data = (IxalanceData*)user_data;
-    if (!data || !data->player || !buffer) {
-        return 0;
-    }
-
     IXS::PlayerCore* core = data->player->ptrCore_0x4;
-    if (!core->ptrMixer_0x3224) {
-        return 0;
-    }
-
-    // Lazy initialization: allocate scope capture on first call
-    if (!data->scope_capture) {
-        uint32_t buf_len = core->ptrMixer_0x3224->sampleBuf16Length_0xc;
-        data->scope_capture = ixs_scope_capture_create(buf_len);
+    if (on) {
         if (!data->scope_capture) {
-            return 0;
+            if (!core->ptrMixer_0x3224) {
+                return; // mixer not ready yet; cannot size the capture buffer
+            }
+            uint32_t buf_len = core->ptrMixer_0x3224->sampleBuf16Length_0xc;
+            data->scope_capture = ixs_scope_capture_create(buf_len);
+            if (!data->scope_capture) {
+                return;
+            }
         }
         core->scopeCapture = data->scope_capture;
+        data->scope_enabled = true;
+    } else {
+        core->scopeCapture = nullptr;
+        data->scope_enabled = false;
     }
+}
 
+static uint32_t ixalance_get_scope_samples(void* user_data, int32_t channel, float* out, uint32_t cap) {
+    IxalanceData* data = (IxalanceData*)user_data;
+    if (!data || !data->scope_enabled || !data->scope_capture || !out) {
+        return 0; // silent until set_scope_enabled(true)
+    }
     if (channel < 0 || channel >= IXS_MAX_SCOPE_CHANNELS) {
         return 0;
     }
 
-    uint32_t available = num_samples;
+    uint32_t available = cap;
     if (available > IXS_SCOPE_BUFFER_SIZE) {
         available = IXS_SCOPE_BUFFER_SIZE;
     }
@@ -587,33 +640,10 @@ static uint32_t ixalance_get_scope_data(void* user_data, int channel, float* buf
     int start = (wp - (int)available + IXS_SCOPE_BUFFER_SIZE) & (IXS_SCOPE_BUFFER_SIZE - 1);
 
     for (uint32_t i = 0; i < available; i++) {
-        buffer[i] = data->scope_capture->buffers[channel][(start + i) & (IXS_SCOPE_BUFFER_SIZE - 1)];
+        out[i] = data->scope_capture->buffers[channel][(start + i) & (IXS_SCOPE_BUFFER_SIZE - 1)];
     }
 
     return available;
-}
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static uint32_t ixalance_get_scope_channel_names(void* user_data, const char** names, uint32_t max_channels) {
-    IxalanceData* data = (IxalanceData*)user_data;
-    if (!data || !data->player) {
-        return 0;
-    }
-
-    IXS::Module* module = data->player->ptrCore_0x4->ptrModule_0x8;
-    uint32_t count = (uint32_t)ixs_get_num_channels(module);
-
-    static char s_name_bufs[64][8];
-    if (count > 64) count = 64;
-    if (count > max_channels) count = max_channels;
-
-    for (uint32_t i = 0; i < count; i++) {
-        snprintf(s_name_bufs[i], sizeof(s_name_bufs[i]), "Ch %u", i + 1);
-        names[i] = s_name_bufs[i];
-    }
-
-    return count;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -643,12 +673,17 @@ static RVPlaybackPlugin g_ixalance_plugin = {
     ixalance_metadata,
     ixalance_static_init,
     nullptr, // settings_updated
-    ixalance_get_tracker_info,
-    ixalance_get_pattern_cell,
-    ixalance_get_pattern_num_rows,
-    ixalance_get_scope_data,
     nullptr, // static_destroy
-    ixalance_get_scope_channel_names
+    ixalance_get_structure,
+    ixalance_get_columns,
+    ixalance_get_pattern_channels,
+    ixalance_get_scope_channels,
+    ixalance_get_position,
+    ixalance_get_channel_rows,
+    ixalance_get_cells,
+    ixalance_set_scope_enabled,
+    ixalance_get_scope_samples,
+    nullptr, // get_vu
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
