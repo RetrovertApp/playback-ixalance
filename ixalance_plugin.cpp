@@ -44,6 +44,9 @@ struct IxalanceData {
     IXS::PlayerIXS* player;
     uint8_t* file_data;
     bool playing;
+    // Part of the last generated block that did not fit the previous read
+    uint32_t pending_frames;
+    uint32_t pending_offset;
     // Fallback decompression buffer when the engine's live pattern buffer is absent
     uint8_t tracker_pattern_buf[64000];
     // Scope capture (allocated/attached by set_scope_enabled)
@@ -144,6 +147,8 @@ static int ixalance_open(void* user_data, const char* url, uint32_t subsong, con
         data->file_data = nullptr;
     }
     data->playing = false;
+    data->pending_frames = 0;
+    data->pending_offset = 0;
 
     // Destroy and recreate player for clean state
     if (data->player) {
@@ -215,32 +220,37 @@ static RVReadInfo ixalance_read_data(void* user_data, RVReadData dest) {
         return (RVReadInfo){format, 0, RVReadStatus_Finished};
     }
 
-    // Check if song has ended
-    if ((*data->player->vftable->isSongEnd)(data->player)) {
-        data->playing = false;
-        return (RVReadInfo){format, 0, RVReadStatus_Finished};
+    // Generate the next block unless part of the previous one is still pending
+    if (data->pending_frames == 0) {
+        if ((*data->player->vftable->isSongEnd)(data->player)) {
+            data->playing = false;
+            return (RVReadInfo){format, 0, RVReadStatus_Finished};
+        }
+
+        (*data->player->vftable->genAudio)(data->player);
+
+        uint8_t* audio_buf = (*data->player->vftable->getAudioBuffer)(data->player);
+        uint32_t num_frames = (*data->player->vftable->getAudioBufferLen)(data->player);
+        if (!audio_buf || num_frames == 0) {
+            return (RVReadInfo){format, 0, RVReadStatus_Ok};
+        }
+        data->pending_frames = num_frames;
+        data->pending_offset = 0;
     }
 
-    // Generate one block of audio
-    (*data->player->vftable->genAudio)(data->player);
-
-    // Get the generated audio buffer and length
-    uint8_t* audio_buf = (*data->player->vftable->getAudioBuffer)(data->player);
-    uint32_t num_frames = (*data->player->vftable->getAudioBufferLen)(data->player);
-
-    if (!audio_buf || num_frames == 0) {
-        return (RVReadInfo){format, 0, RVReadStatus_Ok};
-    }
-
-    // Calculate how many frames we can fit in the output buffer
     uint32_t bytes_per_frame = sizeof(int16_t) * IXS_CHANNELS;
-    uint32_t max_frames = dest.channels_output_max_bytes_size / bytes_per_frame;
-    uint32_t frames_to_copy = num_frames < max_frames ? num_frames : max_frames;
+    uint32_t capacity_frames = dest.channels_output_max_bytes_size / bytes_per_frame;
+    uint32_t max_frames = dest.info.frame_count < capacity_frames ? dest.info.frame_count : capacity_frames;
+    uint32_t frames_to_copy = data->pending_frames < max_frames ? data->pending_frames : max_frames;
 
-    memcpy(dest.channels_output, audio_buf, frames_to_copy * bytes_per_frame);
+    uint8_t* audio_buf = (*data->player->vftable->getAudioBuffer)(data->player);
+    memcpy(dest.channels_output, audio_buf + data->pending_offset * bytes_per_frame,
+           frames_to_copy * bytes_per_frame);
+    data->pending_offset += frames_to_copy;
+    data->pending_frames -= frames_to_copy;
 
-    // Check if song ended after generating
-    if ((*data->player->vftable->isSongEnd)(data->player)) {
+    // Check if song ended after draining the block
+    if (data->pending_frames == 0 && (*data->player->vftable->isSongEnd)(data->player)) {
         data->playing = false;
         return (RVReadInfo){format, frames_to_copy, RVReadStatus_Finished};
     }
