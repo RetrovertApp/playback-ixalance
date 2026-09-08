@@ -1,0 +1,9 @@
+[plugin]
+name = "ixalance"
+
+[data]
+entries = []
+
+[[fixtures]]
+file = "fixtures/retrovert_selftest.ixs"
+sha256 = "2bc1f19f96b3f04e9483795c3aab43da0072a171b3795ebf19ae3e30ebf06340"

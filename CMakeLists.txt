@@ -42,7 +42,11 @@ add_library(ixalance_playback SHARED ixalance_plugin.cpp)
 target_include_directories(ixalance_playback PRIVATE src)
 target_link_libraries(ixalance_playback PRIVATE ixalance_static zlib_static)
 if(NOT WIN32)
-    target_link_libraries(ixalance_playback PRIVATE stdc++ m)
+    # No explicit -lstdc++: the plugin is already a C++ target, so the C++
+    # runtime follows the toolchain's static/dynamic choice. Naming it here
+    # made the artifact DT_NEED the shared libstdc++, which the harness's
+    # allowlist rejects.
+    target_link_libraries(ixalance_playback PRIVATE m)
 endif()
 set_target_properties(ixalance_playback PROPERTIES CXX_STANDARD 14)
 rv_set_plugin_properties(ixalance_playback)
